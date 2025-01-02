@@ -1052,9 +1052,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m in {ECA, SCINet, CBAM}:
             c2 = ch[f]
             args = [c2, *args]
-        elif m in {FreqFusion}:
-            c2 = ch[f[0]]
-            args = [[ch[x] for x in f], *args]
+        # elif m in {FreqFusion}:
+        #     c2 = ch[f[0]]
+        #     args = [[ch[x] for x in f], *args]
         elif m in {Bi_FPN}:
             length = len([ch[x] for x in f])
             args = [length]
