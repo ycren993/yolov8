@@ -3,12 +3,16 @@
 import contextlib
 import pickle
 import re
+from .modules.RepViT import repvit_m0_6, repvit_m0_9, repvit_m1_0, repvit_m1_1, repvit_m1_5, repvit_m2_3
+from .modules.GFPN import CSPStage
 import types
 from copy import deepcopy
 from pathlib import Path
 from .Addmodules import *
+from .modules.BiFPN import Bi_FPN
 import torch
 import torch.nn as nn
+from .modules.CLLAhead import CLLAHead
 from .modules.AFPN import Detect_AFPN
 from ultralytics.nn.modules import (
     AIFI,
@@ -129,18 +133,17 @@ class BaseModel(nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=False, visualize=False,embed=None):
         """
         Perform a forward pass through the network.
         Args:
             x (torch.Tensor): The input tensor to the model.
             profile (bool):  Print the computation time of each layer if True, defaults to False.
             visualize (bool): Save the feature maps of the model if True, defaults to False.
-            embed (list, optional): A list of feature vectors/embeddings to return.
         Returns:
             (torch.Tensor): The last output of the model.
         """
-        y, dt, embeddings = [], [], []  # outputs
+        y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -161,10 +164,6 @@ class BaseModel(nn.Module):
                 y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
-            if embed and m.i in embed:
-                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
-                if m.i == max(embed):
-                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
 
     def _predict_augment(self, x):
@@ -266,7 +265,8 @@ class BaseModel(nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Detect_AFPN)):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
+        if isinstance(m, (
+        Detect, Detect_AFPN, CLLAHead)):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
@@ -332,7 +332,8 @@ class DetectionModel(BaseModel):
 
         # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect,Detect_AFPN)):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
+        if isinstance(m, (
+        Detect, Detect_AFPN, CLLAHead)):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
             s = 640  # 2x min stride
             m.inplace = self.inplace
 
@@ -385,9 +386,9 @@ class DetectionModel(BaseModel):
     def _clip_augmented(self, y):
         """Clip YOLO augmented inference tails."""
         nl = self.model[-1].nl  # number of detection layers (P3-P5)
-        g = sum(4**x for x in range(nl))  # grid points
+        g = sum(4 ** x for x in range(nl))  # grid points
         e = 1  # exclude layer count
-        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # indices
+        i = (y[0].shape[-1] // g) * sum(4 ** x for x in range(e))  # indices
         y[0] = y[0][..., :-i]  # large
         i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
         y[-1] = y[-1][..., i:]  # small
@@ -624,7 +625,7 @@ class WorldModel(DetectionModel):
             import clip
 
         if (
-            not getattr(self, "clip_model", None) and cache_clip_model
+                not getattr(self, "clip_model", None) and cache_clip_model
         ):  # for backwards compatibility of models lacking clip_model attribute
             self.clip_model = clip.load("ViT-B/32")[0]
         model = self.clip_model if cache_clip_model else clip.load("ViT-B/32")[0]
@@ -824,16 +825,16 @@ def torch_safe_load(weight, safe_only=False):
     file = attempt_download_asset(weight)  # search online if missing locally
     try:
         with temporary_modules(
-            modules={
-                "ultralytics.yolo.utils": "ultralytics.utils",
-                "ultralytics.yolo.v8": "ultralytics.models.yolo",
-                "ultralytics.yolo.data": "ultralytics.data",
-            },
-            attributes={
-                "ultralytics.nn.modules.block.Silence": "torch.nn.Identity",  # YOLOv9e
-                "ultralytics.nn.tasks.YOLOv10DetectionModel": "ultralytics.nn.tasks.DetectionModel",  # YOLOv10
-                "ultralytics.utils.loss.v10DetectLoss": "ultralytics.utils.loss.E2EDetectLoss",  # YOLOv10
-            },
+                modules={
+                    "ultralytics.yolo.utils": "ultralytics.utils",
+                    "ultralytics.yolo.v8": "ultralytics.models.yolo",
+                    "ultralytics.yolo.data": "ultralytics.data",
+                },
+                attributes={
+                    "ultralytics.nn.modules.block.Silence": "torch.nn.Identity",  # YOLOv9e
+                    "ultralytics.nn.tasks.YOLOv10DetectionModel": "ultralytics.nn.tasks.DetectionModel",  # YOLOv10
+                    "ultralytics.utils.loss.v10DetectLoss": "ultralytics.utils.loss.E2EDetectLoss",  # YOLOv10
+                },
         ):
             if safe_only:
                 # Load via custom pickle module
@@ -896,7 +897,8 @@ def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
 
     # Module updates
     for m in ensemble.modules():
-        if hasattr(m, "inplace"):
+        t = type(m)
+        if hasattr(m, "inplace") or t in (CLLAHead,):
             m.inplace = inplace
         elif isinstance(m, nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
@@ -931,7 +933,8 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
 
     # Module updates
     for m in model.modules():
-        if hasattr(m, "inplace"):
+        t = type(m)
+        if hasattr(m, "inplace") or t in (CLLAHead,):
             m.inplace = inplace
         elif isinstance(m, nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
@@ -965,9 +968,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    backbone=False
+    backbone = False
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        t=m
+        t = m
         m = getattr(torch.nn, m[3:]) if "nn." in m else globals()[m]  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
@@ -1008,6 +1011,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             PSA,
             SCDown,
             C2f_GhostModule_DynamicConv,
+            CSPPC,
+            CSPStage
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1034,7 +1039,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2fPSA,
                 C2fCIB,
                 C2PSA,
-                C2f_GhostModule_DynamicConv
+                C2f_GhostModule_DynamicConv,
+                CSPPC,
+                CSPStage
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1
@@ -1042,11 +1049,21 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
-        elif m in {ECA,SCINet}:
+        elif m in {ECA, SCINet, CBAM}:
             c2 = ch[f]
             args = [c2, *args]
+        elif m in {FreqFusion}:
+            c2 = ch[f[0]]
+            args = [[ch[x] for x in f], *args]
+        elif m in {Bi_FPN}:
+            length = len([ch[x] for x in f])
+            args = [length]
         elif m in {mobile_vit2_xx_small}:
             m = m(*args)
+            c2 = m.width_list  # 返回通道列表
+            backbone = True
+        elif m in {repvit_m0_6, repvit_m0_9, repvit_m1_0, repvit_m1_1, repvit_m1_5, repvit_m2_3}:
+            m = m()
             c2 = m.width_list  # 返回通道列表
             backbone = True
         elif m is AIFI:
@@ -1063,7 +1080,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect,Detect_AFPN}:
+        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect, Detect_AFPN, CLLAHead}:
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -1192,7 +1209,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, v10Detect)):
+            elif isinstance(m, (Detect, WorldDetect, v10Detect, CLLAHead)):
                 return "detect"
 
     # Guess from model filename

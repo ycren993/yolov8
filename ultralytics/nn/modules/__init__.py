@@ -85,7 +85,6 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-
 __all__ = (
     "Conv",
     "Conv2",
